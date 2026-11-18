@@ -1,5 +1,6 @@
 package com.deskcast.client;
 
+import android.os.Process;
 import android.util.Base64;
 
 import java.io.BufferedInputStream;
@@ -13,9 +14,9 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
-import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
@@ -39,8 +40,11 @@ public class WsClient {
     private Socket socket;
     private OutputStream out;
     private final Object writeLock = new Object();
-    private final Random rng = new SecureRandom();
-    private final ExecutorService sendExec = Executors.newSingleThreadExecutor();
+    private final ExecutorService sendExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ws-send");
+        t.setPriority(Thread.MAX_PRIORITY);
+        return t;
+    });
 
     public WsClient(String host, int port, boolean useTls, Listener listener) {
         this.host = host;
@@ -51,7 +55,9 @@ public class WsClient {
 
     public void start() {
         running = true;
-        new Thread(this::runLoop, "ws-reader").start();
+        Thread t = new Thread(this::runLoop, "ws-reader");
+        t.setPriority(Thread.MAX_PRIORITY);
+        t.start();
     }
 
     public void close() {
@@ -66,6 +72,7 @@ public class WsClient {
         Socket raw = new Socket();
         raw.setTcpNoDelay(true);
         raw.setKeepAlive(true);
+        try { raw.setPerformancePreferences(0, 2, 1); } catch (Exception ignored) {}
         try { raw.setTrafficClass(0x10); } catch (Exception ignored) {}
         raw.setReceiveBufferSize(512 * 1024);
         raw.connect(new InetSocketAddress(host, port), 5000);
@@ -86,6 +93,7 @@ public class WsClient {
     }
 
     private void runLoop() {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY); } catch (Throwable ignored) {}
         String closeReason = "Desconectado";
         try {
             socket = createSocket();
@@ -94,7 +102,7 @@ public class WsClient {
             out = socket.getOutputStream();
 
             byte[] keyBytes = new byte[16];
-            rng.nextBytes(keyBytes);
+            ThreadLocalRandom.current().nextBytes(keyBytes);
             String key = Base64.encodeToString(keyBytes, Base64.NO_WRAP);
             String req =
                 "GET /ws HTTP/1.1\r\n" +
@@ -200,25 +208,31 @@ public class WsClient {
         synchronized (writeLock) {
             if (out == null) return;
             int n = payload.length;
-            ByteArrayOutputStream hdr = new ByteArrayOutputStream(16 + n);
-            hdr.write(0x80 | opcode);
+            int hdrLen = 2 + (n < 126 ? 0 : (n < 65536 ? 2 : 8)) + 4;
+            byte[] pkt = new byte[hdrLen + n];
+            pkt[0] = (byte) (0x80 | opcode);
+            int p = 2;
             if (n < 126) {
-                hdr.write(0x80 | n);
+                pkt[1] = (byte) (0x80 | n);
             } else if (n < 65536) {
-                hdr.write(0x80 | 126);
-                hdr.write((n >> 8) & 0xFF);
-                hdr.write(n & 0xFF);
+                pkt[1] = (byte) (0x80 | 126);
+                pkt[2] = (byte) ((n >> 8) & 0xFF);
+                pkt[3] = (byte) (n & 0xFF);
+                p = 4;
             } else {
-                hdr.write(0x80 | 127);
-                for (int i = 7; i >= 0; i--) hdr.write((int) ((n >> (i * 8)) & 0xFF));
+                pkt[1] = (byte) (0x80 | 127);
+                for (int i = 7; i >= 0; i--) pkt[p++] = (byte) ((n >> (i * 8)) & 0xFF);
             }
-            byte[] mask = new byte[4];
-            rng.nextBytes(mask);
-            hdr.write(mask);
-            byte[] masked = new byte[n];
-            for (int i = 0; i < n; i++) masked[i] = (byte) (payload[i] ^ mask[i % 4]);
-            hdr.write(masked);
-            out.write(hdr.toByteArray());
+            int maskVal = ThreadLocalRandom.current().nextInt();
+            byte m0 = (byte) (maskVal & 0xFF);
+            byte m1 = (byte) ((maskVal >> 8) & 0xFF);
+            byte m2 = (byte) ((maskVal >> 16) & 0xFF);
+            byte m3 = (byte) ((maskVal >> 24) & 0xFF);
+            pkt[p] = m0; pkt[p + 1] = m1; pkt[p + 2] = m2; pkt[p + 3] = m3;
+            byte[] mask = new byte[]{m0, m1, m2, m3};
+            int off = p + 4;
+            for (int i = 0; i < n; i++) pkt[off + i] = (byte) (payload[i] ^ mask[i & 3]);
+            out.write(pkt);
             out.flush();
         }
     }

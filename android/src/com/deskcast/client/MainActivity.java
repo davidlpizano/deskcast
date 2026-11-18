@@ -66,6 +66,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             lastCodecErr = msg;
             ui.post(() -> statusBadge.setText(msg));
         }
+
+        @Override
+        public void onRequestKeyframe() {
+            if (ws != null) ws.sendText("{\"type\":\"keyframe\"}");
+        }
     });
     private WsClient ws;
     private WifiManager.WifiLock wifiLock;
@@ -100,7 +105,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (!lastCodecErr.isEmpty()) {
                 statusBadge.setText(lastCodecErr);
             } else {
-                String prefix = (ws != null) ? (f == 0 ? "H.264 (reposo)" : "H.264 HW") : "Sin conexión";
+                String via = (activeHost != null && !activeHost.isEmpty()) ? (" [" + activeHost + "]") : "";
+                String prefix = (ws != null) ? (f == 0 ? "H.264 (reposo)" : ("H.264 HW" + via)) : "Sin conexión";
                 String lat = lastPingMs > 0 ? (" · " + lastPingMs + "ms") : "";
                 statusBadge.setText(prefix + " · " + streamW + "×" + streamH + " · " + f + " FPS · " + bw + lat);
             }
@@ -116,11 +122,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         buildUi();
+        syncDisplayRefreshRate();
         enterFullscreen();
         ui.postDelayed(statsTick, 1000);
 
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        if (sp.contains("host")) {
+        String intentHost = getIntent() != null ? getIntent().getStringExtra("host") : null;
+        if (intentHost != null && !intentHost.trim().isEmpty()) {
+            editHost.setText(intentHost.trim());
+            connectNow();
+        } else if (sp.contains("host")) {
             connectNow();
         }
     }
@@ -149,6 +160,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         );
         root.addView(surfaceView, svLp);
         surfaceView.setOnTouchListener((v, ev) -> handleSurfaceTouch(ev));
+        surfaceView.setOnHoverListener((v, ev) -> handleSurfaceHover(ev));
 
         // Input invisible para teclado móvil
         kbdBridge = new EditText(this);
@@ -483,26 +495,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    private volatile String activeHost = "";
+    private volatile boolean upgradedToFastHost = false;
+
     private void connectNow() {
-        userDisconnected = false;
+        upgradedToFastHost = false;
         String host = editHost.getText().toString().trim();
+        connectToHost(host, true);
+    }
+
+    private void connectToHost(String host, boolean savePrefs) {
+        userDisconnected = false;
+        activeHost = host;
         int port = 8765;
         try { port = Integer.parseInt(editPort.getText().toString().trim()); } catch (Exception ignored) {}
         boolean tls = chkHttps.isChecked();
         String pin = editPin.getText().toString().trim();
 
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString("host", host)
-            .putString("port", String.valueOf(port))
-            .putString("pin", pin)
-            .putBoolean("https", tls)
-            .putBoolean("trackpad", chkTrackpad.isChecked())
-            .apply();
-
-        if (ws != null) {
-            ws.close();
-            ws = null;
+        if (savePrefs) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString("host", host)
+                .putString("port", String.valueOf(port))
+                .putString("pin", pin)
+                .putBoolean("https", tls)
+                .putBoolean("trackpad", chkTrackpad.isChecked())
+                .apply();
         }
+
+        WsClient prev = ws;
+        ws = null;
+        if (prev != null) prev.close();
         renderer.reset();
         acquireWifiLock();
 
@@ -512,9 +534,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         ui.post(() -> statusBadge.setText("Conectando a " + fHost + ":" + fPort + "..."));
 
-        ws = new WsClient(host, port, tls, new WsClient.Listener() {
+        final WsClient[] holder = new WsClient[1];
+        WsClient cli = new WsClient(host, port, tls, new WsClient.Listener() {
             @Override
             public void onOpen() {
+                if (ws != holder[0]) return;
                 if (ws != null) {
                     ws.sendText("{\"type\":\"caps\",\"webcodecs\":true,\"native\":true}");
                     if (!fPin.isEmpty()) {
@@ -526,6 +550,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             @Override
             public void onText(String text) {
+                if (ws != holder[0]) return;
                 try {
                     JSONObject obj = new JSONObject(text);
                     String type = obj.optString("type");
@@ -537,6 +562,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         int h = obj.optInt("height", streamH);
                         String codec = obj.optString("codec", "tiles");
                         boolean authed = obj.optBoolean("authed", true);
+                        String fastHost = obj.optString("fastHost", "");
                         mirrorMode = obj.optBoolean("mirror", false);
                         ui.post(() -> {
                             streamW = w;
@@ -546,6 +572,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         });
                         if (authed && !"h264".equals(codec) && ws != null) {
                             ws.sendText("{\"type\":\"config\",\"codec\":\"h264\"}");
+                        }
+                        if (!upgradedToFastHost && "127.0.0.1".equals(fHost) && !fastHost.isEmpty() && !fastHost.equals(fHost)) {
+                            upgradedToFastHost = true;
+                            new Thread(() -> {
+                                try (java.net.Socket probe = new java.net.Socket()) {
+                                    long t0 = System.nanoTime();
+                                    probe.connect(new java.net.InetSocketAddress(fastHost, fPort), 160);
+                                    double ms = (System.nanoTime() - t0) / 1e6;
+                                    if (ms < 30.0) {
+                                        ui.post(() -> {
+                                            if (!userDisconnected && !isFinishing() && ws == holder[0]) {
+                                                connectToHost(fastHost, false);
+                                            }
+                                        });
+                                    }
+                                } catch (Exception ignored) {
+                                }
+                            }, "fast-probe").start();
                         }
                     } else if ("auth_ok".equals(type) && ws != null) {
                         ws.sendText("{\"type\":\"config\",\"codec\":\"h264\"}");
@@ -561,6 +605,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             @Override
             public void onBinary(byte[] data) {
+                if (ws != holder[0]) return;
                 bytesCounter += data.length;
                 if (data.length > 6 && data[0] == 0x03) {
                     int w = ((data[1] & 0xFF) << 8) | (data[2] & 0xFF);
@@ -585,6 +630,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             @Override
             public void onClose(String reason) {
+                if (ws != holder[0]) return;
                 renderer.reset();
                 lastPingMs = 0;
                 ui.post(() -> {
@@ -597,7 +643,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 });
             }
         });
-        ws.start();
+        holder[0] = cli;
+        ws = cli;
+        cli.start();
     }
 
     private void sendConfig() {
@@ -665,12 +713,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + trackX + ",\"y\":" + trackY + ",\"button\":" + btn + "}");
             } else if (action == MotionEvent.ACTION_MOVE && !scrolling2F) {
                 long now = System.currentTimeMillis();
-                if (now - lastMoveTs >= 12) {
+                float dx = ev.getX() - lastTouchX;
+                float dy = ev.getY() - lastTouchY;
+                float speed = (float) Math.hypot(dx, dy);
+                float gain = 1.55f + Math.min(1.2f, speed / 35.0f);
+                trackX = Math.max(0.0, Math.min(1.0, trackX + (dx * gain) / vw));
+                trackY = Math.max(0.0, Math.min(1.0, trackY + (dy * gain) / vh));
+                lastTouchX = ev.getX();
+                lastTouchY = ev.getY();
+                if (now - lastMoveTs >= 7) {
                     lastMoveTs = now;
-                    trackX = Math.max(0.0, Math.min(1.0, trackX + (ev.getX() - lastTouchX) * 1.3 / vw));
-                    trackY = Math.max(0.0, Math.min(1.0, trackY + (ev.getY() - lastTouchY) * 1.3 / vh));
-                    lastTouchX = ev.getX();
-                    lastTouchY = ev.getY();
                     ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + trackX + ",\"y\":" + trackY + "}");
                 }
             } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
@@ -692,7 +744,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + btn + "}");
         } else if (action == MotionEvent.ACTION_MOVE && !scrolling2F) {
             long now = System.currentTimeMillis();
-            if (now - lastMoveTs >= 12) {
+            if (now - lastMoveTs >= 7) {
                 lastMoveTs = now;
                 ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + nx + ",\"y\":" + ny + "}");
             }
@@ -703,9 +755,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return true;
     }
 
+    private boolean handleSurfaceHover(MotionEvent ev) {
+        if (ws == null) return false;
+        int act = ev.getActionMasked();
+        if (act != MotionEvent.ACTION_HOVER_MOVE && act != MotionEvent.ACTION_HOVER_ENTER) return false;
+        long now = System.currentTimeMillis();
+        if (now - lastMoveTs < 7) return true;
+        lastMoveTs = now;
+        int vw = Math.max(1, surfaceView.getWidth());
+        int vh = Math.max(1, surfaceView.getHeight());
+        double nx = Math.max(0.0, Math.min(1.0, ev.getX() / vw));
+        double ny = Math.max(0.0, Math.min(1.0, ev.getY() / vh));
+        ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + nx + ",\"y\":" + ny + "}");
+        return true;
+    }
+
+    private void syncDisplayRefreshRate() {
+        try {
+            android.view.Display disp = (Build.VERSION.SDK_INT >= 30)
+                ? getDisplay()
+                : getWindowManager().getDefaultDisplay();
+            if (disp == null) disp = getWindowManager().getDefaultDisplay();
+            if (disp != null) {
+                float hz = disp.getRefreshRate();
+                if (hz > 0f) renderer.setDisplayRefreshRate(hz);
+            }
+        } catch (Exception ignored) {}
+    }
+
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         surfaceReady = true;
+        syncDisplayRefreshRate();
         renderer.setSurface(holder.getSurface());
         byte[] pk = pendingKeyPacket;
         pendingKeyPacket = null;
@@ -720,6 +801,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         surfaceReady = true;
+        syncDisplayRefreshRate();
         renderer.setSurface(holder.getSurface());
     }
 

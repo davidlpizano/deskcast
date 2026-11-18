@@ -31,7 +31,7 @@ except Exception:
     GstVideo = None
 
 from mutter_display import MutterVirtualMonitor  # noqa: E402
-from red_remota import detectar_redes  # noqa: E402
+from red_remota import detectar_redes, mejor_ip_directa  # noqa: E402
 
 Gst.init(None)
 
@@ -258,6 +258,7 @@ class _X11WakePixel:
             x11.XFlush(ctypes.c_void_p(dpy))
 
             tick = 0
+            nxt = time.monotonic()
             while True:
                 with self._lock:
                     if not self._running:
@@ -272,7 +273,14 @@ class _X11WakePixel:
                 x11.XSetWindowBackground(ctypes.c_void_p(dpy), ctypes.c_ulong(win), 0x010101 if tick else 0x020202)
                 x11.XClearWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(win))
                 x11.XFlush(ctypes.c_void_p(dpy))
-                time.sleep(1.0 / max(10, fps))
+                period = 1.0 / max(10, fps)
+                nxt += period
+                now = time.monotonic()
+                if nxt < now - period:
+                    nxt = now + period
+                dt = nxt - now
+                if dt > 0:
+                    time.sleep(dt)
         except Exception:
             pass
         finally:
@@ -469,9 +477,10 @@ class DeskCastServer:
         return False
 
     def _keepalive_ms(self):
-        if not self.keep_fps:
+        if not self.keep_fps or (not self.mirror and self.codec == 'h264'):
+            # En extensor H.264, _X11WakePixel marca el reloj exacto sin dobles frames
             return 0
-        # 24-30 FPS en reposo para mantener fluidez sin saturar ADB/Wi-Fi
+        # En modo espejo, 24-30 FPS en reposo para mantener fluidez sin saturar ADB/Wi-Fi
         return max(33, min(50, int(1000 / min(30, max(10, self.fps)))))
 
     def _launch_pipeline(self, node_id):
@@ -482,11 +491,11 @@ class DeskCastServer:
                 f'pipewiresrc name=pwsrc path={node_id} keepalive-time={ka} do-timestamp=true ! '
                 f'{caps} ! videoconvert n-threads=4 ! video/x-raw,format=I420 ! '
                 f'x264enc name=venc tune=zerolatency speed-preset=ultrafast bitrate={self.bitrate} '
-                f'vbv-buf-capacity=300 qp-min=10 qp-max=36 '
-                f'key-int-max=300 bframes=0 threads=4 sliced-threads=true rc-lookahead=0 ! '
+                f'vbv-buf-capacity=50 qp-min=14 qp-max=34 '
+                f'key-int-max=240 bframes=0 aud=false threads=4 sliced-threads=true rc-lookahead=0 ! '
                 f'h264parse config-interval=-1 ! '
                 f'video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! '
-                f'appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false'
+                f'appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false'
             )
         else:
             p_str = (
@@ -531,27 +540,33 @@ class DeskCastServer:
         if not ok:
             return Gst.FlowReturn.OK
 
+        h264_pkt = None
+        cur_buf = None
         try:
             st = sample.get_caps().get_structure(0)
             ok_w, cw = st.get_int('width')
             ok_h, ch = st.get_int('height')
             w = cw if ok_w else self.width
             h = ch if ok_h else self.height
-            cur_buf = bytearray(map_info.data)
+            if self.codec == 'h264':
+                raw_bytes = bytes(map_info.data)
+                h264_pkt = struct.pack('!BHHB', 0x03, w, h, 1 if is_key else 0) + raw_bytes
+                raw_len = len(raw_bytes)
+            else:
+                cur_buf = bytearray(map_info.data)
         finally:
             buf.unmap(map_info)
 
-        if self.codec == 'h264':
-            pkt = struct.pack('!BHHB', 0x03, w, h, 1 if is_key else 0) + bytes(cur_buf)
+        if h264_pkt is not None:
             if is_key:
-                self._last_h264_kf = pkt
+                self._last_h264_kf = h264_pkt
             with self._stats_lock:
                 self._fps_counter += 1
-                if len(cur_buf) > 900:
+                if raw_len > 900:
                     self._cap_counter += 1
             self._roll_stats()
             if self.aio_loop and self.clients:
-                self.aio_loop.call_soon_threadsafe(self._broadcast_h264, pkt, is_key)
+                self.aio_loop.call_soon_threadsafe(self._broadcast_h264, h264_pkt, is_key)
             return Gst.FlowReturn.OK
 
         # Modo Turbo Tiles (RGB24 -> Dirty Tiles Diff en C sin copias extra)
@@ -777,6 +792,8 @@ class DeskCastServer:
         if sock is not None:
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if hasattr(socket, 'TCP_QUICKACK'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
             except Exception:
                 pass
         peer = writer.get_extra_info('peername')
@@ -892,6 +909,13 @@ class DeskCastServer:
         cli = ClientSession(reader, writer, peer, need_pin)
         self.clients.add(cli)
 
+        fast_host = None
+        if peer and peer[0] == '127.0.0.1' and self.aio_loop:
+            try:
+                fast_host = await self.aio_loop.run_in_executor(None, mejor_ip_directa)
+            except Exception:
+                fast_host = None
+
         hello = json.dumps({
             'type': 'hello',
             'width': self.width,
@@ -903,6 +927,7 @@ class DeskCastServer:
             'mirror': self.mirror,
             'needPin': need_pin,
             'authed': cli.authed,
+            'fastHost': fast_host or '',
         }).encode('utf-8')
         await cli.send_ws_frame(0x1, hello)
         if cli.authed:
@@ -952,6 +977,17 @@ class DeskCastServer:
             for i in range(length):
                 data[i] ^= mask[i % 4]
         return opcode, bytes(data)
+
+    @staticmethod
+    def _gl_call(fn, *args):
+        fn(*args)
+        return False
+
+    @staticmethod
+    def _gl_pointer_btn(mon, x, y, btn, pressed):
+        mon.move_pointer_abs(x, y)
+        mon.pointer_button(btn, pressed)
+        return False
 
     async def _handle_ws_msg(self, cli: ClientSession, raw_txt: str):
         try:
@@ -1023,32 +1059,34 @@ class DeskCastServer:
         if mtype == 'pointer' and self.monitor:
             act = msg.get('action')
             x, y = msg.get('x', 0.5), msg.get('y', 0.5)
+            mon = self.monitor
             if act == 'move':
-                GLib.idle_add(lambda: self.monitor.move_pointer_abs(x, y) and False)
+                GLib.idle_add(self._gl_call, mon.move_pointer_abs, x, y, priority=GLib.PRIORITY_HIGH)
             elif act == 'down':
                 btn = msg.get('button', 0)
-                GLib.idle_add(lambda: (self.monitor.move_pointer_abs(x, y), self.monitor.pointer_button(btn, True)) and False)
+                GLib.idle_add(self._gl_pointer_btn, mon, x, y, btn, True, priority=GLib.PRIORITY_HIGH)
             elif act == 'up':
                 btn = msg.get('button', 0)
-                GLib.idle_add(lambda: (self.monitor.move_pointer_abs(x, y), self.monitor.pointer_button(btn, False)) and False)
+                GLib.idle_add(self._gl_pointer_btn, mon, x, y, btn, False, priority=GLib.PRIORITY_HIGH)
             elif act == 'scroll':
                 dx, dy = msg.get('dx', 0), msg.get('dy', 0)
-                GLib.idle_add(lambda: self.monitor.pointer_scroll(dx, dy) and False)
+                GLib.idle_add(self._gl_call, mon.pointer_scroll, dx, dy, priority=GLib.PRIORITY_HIGH)
         elif mtype == 'touch' and self.monitor:
             act = msg.get('action')
             slot = msg.get('id', 0)
             x, y = msg.get('x', 0.5), msg.get('y', 0.5)
+            mon = self.monitor
             if act == 'down':
-                GLib.idle_add(lambda: self.monitor.touch_down(slot, x, y) and False)
+                GLib.idle_add(self._gl_call, mon.touch_down, slot, x, y, priority=GLib.PRIORITY_HIGH)
             elif act == 'move':
-                GLib.idle_add(lambda: self.monitor.touch_motion(slot, x, y) and False)
+                GLib.idle_add(self._gl_call, mon.touch_motion, slot, x, y, priority=GLib.PRIORITY_HIGH)
             elif act == 'up':
-                GLib.idle_add(lambda: self.monitor.touch_up(slot) and False)
+                GLib.idle_add(self._gl_call, mon.touch_up, slot, priority=GLib.PRIORITY_HIGH)
         elif mtype == 'key' and self.monitor:
             ks = int(msg.get('keysym', 0))
             pr = bool(msg.get('pressed', True))
             if ks:
-                GLib.idle_add(lambda: self.monitor.key_sym(ks, pr) and False)
+                GLib.idle_add(self._gl_call, self.monitor.key_sym, ks, pr, priority=GLib.PRIORITY_HIGH)
         elif mtype == 'config':
             self.reconfigure(
                 width=msg.get('width'),

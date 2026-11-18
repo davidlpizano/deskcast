@@ -218,3 +218,20 @@ def desactivar_hotspot():
         return True, 'Hotspot apagado'
     rc, out, err = _run(['nmcli', 'connection', 'down', 'Hotspot'], timeout=6)
     return rc == 0, (err or out or 'Hotspot apagado')
+
+
+def mejor_ip_directa():
+    """Devuelve la mejor IP directa sin proxy ADB (USB Tethering o Hotspot Wi-Fi activo) o None."""
+    rc, out, _ = _run(['ip', '-o', '-4', 'addr', 'show', 'up'], timeout=2)
+    if rc == 0 and out:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                iface = parts[1]
+                ip = parts[3].split('/')[0]
+                if iface.startswith(('usb', 'enx')) and not ip.startswith('127.'):
+                    return ip
+    activo, _, hs_ip, _ = estado_hotspot()
+    if activo and hs_ip:
+        return hs_ip
+    return None

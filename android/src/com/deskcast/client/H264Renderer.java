@@ -3,6 +3,7 @@ package com.deskcast.client;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.os.Build;
+import android.os.Process;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
@@ -12,6 +13,7 @@ public class H264Renderer {
     public interface Callback {
         void onFrameRendered();
         void onError(String msg);
+        default void onRequestKeyframe() {}
     }
 
     private static final class FrameTask {
@@ -42,6 +44,8 @@ public class H264Renderer {
     private volatile boolean active = false;
     private int curW = 0;
     private int curH = 0;
+    private float displayHz = 60f;
+    private long lastKfReqMs = 0L;
     private volatile boolean sawKeyEnqueued = false;
     private long startNs = 0;
 
@@ -49,16 +53,31 @@ public class H264Renderer {
         this.callback = callback;
     }
 
+    public void setDisplayRefreshRate(float hz) {
+        if (hz <= 0f) return;
+        synchronized (codecLock) {
+            this.displayHz = hz;
+            applySurfaceFrameRateLocked(this.surface);
+        }
+    }
+
+    private void applySurfaceFrameRateLocked(Surface s) {
+        if (s == null || !s.isValid() || Build.VERSION.SDK_INT < 30) return;
+        try {
+            // En pantallas de 90 Hz (no múltiplo de 60), pedir 60f fuerza 45 Hz en SurfaceFlinger.
+            // Pedimos la tasa nativa (p.ej. 90f) salvo que 60 sea divisor exacto (60/120 Hz).
+            int rounded = Math.round(displayHz);
+            float target = (rounded >= 60 && rounded % 60 != 0) ? displayHz : 60f;
+            s.setFrameRate(target, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+        } catch (Exception ignored) {}
+    }
+
     public void setSurface(Surface s) {
         synchronized (codecLock) {
             if (this.surface != s) {
                 release();
                 this.surface = s;
-                if (s != null && s.isValid() && Build.VERSION.SDK_INT >= 30) {
-                    try {
-                        s.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
-                    } catch (Exception ignored) {}
-                }
+                applySurfaceFrameRateLocked(s);
             }
         }
     }
@@ -106,6 +125,7 @@ public class H264Renderer {
                 active = true;
                 startNs = System.nanoTime();
                 feedThread = new Thread(this::feedLoop, "h264-feed");
+                feedThread.setPriority(Thread.MAX_PRIORITY);
                 feedThread.start();
             }
         }
@@ -113,16 +133,24 @@ public class H264Renderer {
         FrameTask task = new FrameTask(w, h, isKey, nal, off, len);
         if (isKey) {
             // Si llega un keyframe nuevo y hay cola atrasada, se puede limpiar todo hasta él sin romper nada
-            if (queue.size() > 4) queue.clear();
+            if (queue.size() > 2) queue.clear();
             queue.offer(task);
         } else if (!queue.offer(task)) {
             // Si la cola de 96 frames se llenara por bloqueo extremo, esperar al siguiente keyframe
             sawKeyEnqueued = false;
             queue.clear();
+            if (callback != null) callback.onRequestKeyframe();
+        } else if (queue.size() >= 8 && callback != null) {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastKfReqMs > 400L) {
+                lastKfReqMs = nowMs;
+                callback.onRequestKeyframe();
+            }
         }
     }
 
     private void feedLoop() {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY); } catch (Throwable ignored) {}
         while (active) {
             try {
                 FrameTask t = queue.take();
@@ -150,6 +178,9 @@ public class H264Renderer {
                     if (Build.VERSION.SDK_INT >= 30) {
                         try { fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); } catch (Exception ignored) {}
                     }
+                    if (Build.VERSION.SDK_INT >= 31) {
+                        try { fmt.setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1); } catch (Exception ignored) {}
+                    }
                     try { fmt.setInteger(MediaFormat.KEY_PRIORITY, 0); } catch (Exception ignored) {}
 
                     decoder = MediaCodec.createDecoderByType("video/avc");
@@ -163,7 +194,7 @@ public class H264Renderer {
             }
 
             if (dec == null) return;
-            int inIdx = dec.dequeueInputBuffer(30000);
+            int inIdx = dec.dequeueInputBuffer(10000);
             if (inIdx >= 0) {
                 ByteBuffer inBuf = dec.getInputBuffer(inIdx);
                 if (inBuf != null) {
@@ -198,12 +229,25 @@ public class H264Renderer {
 
     private void startDrainLoopLocked(final MediaCodec codecRef) {
         drainThread = new Thread(() -> {
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY); } catch (Throwable ignored) {}
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             while (active) {
                 try {
-                    int outIdx = codecRef.dequeueOutputBuffer(info, 20000);
+                    int outIdx = codecRef.dequeueOutputBuffer(info, 15000);
                     if (outIdx >= 0) {
-                        codecRef.releaseOutputBuffer(outIdx, true);
+                        // Si ya hay más frames decodificados listos, descartar los intermedios y mostrar solo el más reciente
+                        int latestIdx = outIdx;
+                        while (true) {
+                            int nextIdx = codecRef.dequeueOutputBuffer(info, 0);
+                            if (nextIdx >= 0) {
+                                codecRef.releaseOutputBuffer(latestIdx, false);
+                                latestIdx = nextIdx;
+                                if (callback != null) callback.onFrameRendered();
+                            } else {
+                                break;
+                            }
+                        }
+                        codecRef.releaseOutputBuffer(latestIdx, true);
                         if (callback != null) callback.onFrameRendered();
                     }
                 } catch (IllegalStateException e) {
@@ -216,6 +260,7 @@ public class H264Renderer {
                 }
             }
         }, "h264-drain");
+        drainThread.setPriority(Thread.MAX_PRIORITY);
         drainThread.start();
     }
 
