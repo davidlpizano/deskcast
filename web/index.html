@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>DeskCast · Segundo Monitor</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="stage">
+    <canvas id="screen"></canvas>
+    <div id="status-banner">Conectando a DeskCast...</div>
+
+    <!-- Botón píldora flotante auto-ocultable -->
+    <button id="fab-toggle" title="Opciones del 2º monitor">⚙</button>
+
+    <!-- Panel flotante de control rápido -->
+    <div id="hud-panel" class="is-hidden">
+      <div class="hud-row">
+        <span class="hud-title">DESKCAST · <strong id="hud-res">—</strong></span>
+        <span id="hud-fps" class="hud-badge">0 FPS</span>
+      </div>
+
+      <div class="hud-grid">
+        <label>Entrada
+          <select id="opt-input">
+            <option value="direct">Táctil / Ratón directo</option>
+            <option value="trackpad">Modo Trackpad</option>
+            <option value="view">Solo ver (sin toques)</option>
+          </select>
+        </label>
+        <label>Posición 2º Monitor
+          <select id="opt-pos">
+            <option value="right">A la derecha</option>
+            <option value="left">A la izquierda</option>
+            <option value="top">Arriba</option>
+            <option value="bottom">Abajo</option>
+          </select>
+        </label>
+        <label>Resolución
+          <select id="opt-res">
+            <option value="1024x640">1024×640 (Turbo 4G)</option>
+            <option value="1280x800" selected>1280×800 (Equilibrado)</option>
+            <option value="1600x1000">1600×1000 (Nítido)</option>
+            <option value="1920x1200">1920×1200 (HD+)</option>
+            <option value="1920x1080">1920×1080 (16:9)</option>
+            <option value="auto">Auto Tablet</option>
+          </select>
+        </label>
+        <label>Calidad (<span id="lbl-q">58</span>%)
+          <input id="opt-q" type="range" min="25" max="92" value="58" />
+        </label>
+        <label>Códec
+          <select id="opt-codec">
+            <option value="tiles">Turbo Tiles (JPEG)</option>
+            <option value="h264">H.264 (60 FPS · USB)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="hud-actions">
+        <button id="btn-full" class="btn-pri">⛶ Pantalla completa</button>
+        <button id="btn-kbd" class="btn-sec">⌨ Teclado</button>
+        <button id="btn-rclick" class="btn-sec">Clic derecho</button>
+        <button id="btn-mirror" class="btn-sec">Espejo: OFF</button>
+        <a id="btn-apk" class="btn-sec" href="/deskcast.apk" style="text-decoration:none;display:inline-flex;align-items:center;">App Android (.apk)</a>
+        <button id="btn-close-hud" class="btn-sec">Ocultar</button>
+      </div>
+    </div>
+
+    <!-- Input oculto para teclado móvil/tablet -->
+    <input id="kbd-bridge" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" />
+
+    <!-- Modal PIN si está activado en el PC -->
+    <div id="pin-modal" class="is-hidden">
+      <div class="pin-card">
+        <h2>Introduce el PIN</h2>
+        <p>El servidor Linux requiere tu PIN de acceso remoto.</p>
+        <input id="pin-input" type="password" inputmode="numeric" maxlength="12" placeholder="PIN" />
+        <div id="pin-err"></div>
+        <button id="pin-submit" class="btn-pri">Conectar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

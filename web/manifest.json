@@ -1,0 +1,9 @@
+{
+  "name": "DeskCast · Segundo Monitor",
+  "short_name": "DeskCast",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#060912",
+  "theme_color": "#060912",
+  "start_url": "/"
+}
