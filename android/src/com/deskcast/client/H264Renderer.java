@@ -6,6 +6,7 @@ import android.os.Build;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.LinkedBlockingQueue;
 
 public class H264Renderer {
     public interface Callback {
@@ -13,53 +14,83 @@ public class H264Renderer {
         void onError(String msg);
     }
 
+    private static final class FrameTask {
+        final int w, h;
+        final boolean isKey;
+        final byte[] data;
+        final int off, len;
+
+        FrameTask(int w, int h, boolean isKey, byte[] data, int off, int len) {
+            this.w = w;
+            this.h = h;
+            this.isKey = isKey;
+            this.data = data;
+            this.off = off;
+            this.len = len;
+        }
+    }
+
     private final Callback callback;
+    private final LinkedBlockingQueue<FrameTask> queue = new LinkedBlockingQueue<>(12);
+    private final Object codecLock = new Object();
+
     private MediaCodec decoder;
     private Surface surface;
+    private Thread feedThread;
     private Thread drainThread;
-    private volatile boolean draining = false;
+    private volatile boolean active = false;
     private int curW = 0;
     private int curH = 0;
     private boolean waitingKey = true;
-    private long ptsUs = 0;
+    private volatile boolean sawKeyEnqueued = false;
+    private long startNs = 0;
 
     public H264Renderer(Callback callback) {
         this.callback = callback;
     }
 
-    public synchronized void setSurface(Surface s) {
-        if (this.surface != s) {
-            release();
-            this.surface = s;
-            if (s != null && s.isValid() && Build.VERSION.SDK_INT >= 30) {
-                try {
-                    s.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
-                } catch (Exception ignored) {}
+    public void setSurface(Surface s) {
+        synchronized (codecLock) {
+            if (this.surface != s) {
+                release();
+                this.surface = s;
+                if (s != null && s.isValid() && Build.VERSION.SDK_INT >= 30) {
+                    try {
+                        s.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+                    } catch (Exception ignored) {}
+                }
             }
         }
     }
 
-    public synchronized void reset() {
+    public void reset() {
         release();
-        waitingKey = true;
     }
 
     public void release() {
-        Thread dt;
+        Thread ft, dt;
         MediaCodec dec;
-        synchronized (this) {
-            draining = false;
+        synchronized (codecLock) {
+            active = false;
+            ft = feedThread;
             dt = drainThread;
+            feedThread = null;
             drainThread = null;
             dec = decoder;
             decoder = null;
             curW = 0;
             curH = 0;
             waitingKey = true;
+            sawKeyEnqueued = false;
+            queue.clear();
+        }
+        if (ft != null) {
+            ft.interrupt();
+            try { ft.join(250); } catch (InterruptedException ignored) {}
         }
         if (dt != null) {
             dt.interrupt();
-            try { dt.join(300); } catch (InterruptedException ignored) {}
+            try { dt.join(250); } catch (InterruptedException ignored) {}
         }
         if (dec != null) {
             try { dec.stop(); } catch (Exception ignored) {}
@@ -67,56 +98,130 @@ public class H264Renderer {
         }
     }
 
-    public synchronized void decodeFrame(int w, int h, boolean isKey, byte[] nal, int off, int len) {
-        if (surface == null || !surface.isValid()) return;
-        if (waitingKey && !isKey) return;
+    public void decodeFrame(int w, int h, boolean isKey, byte[] nal, int off, int len) {
+        if (isKey) sawKeyEnqueued = true;
+        if (!sawKeyEnqueued) return;
+        synchronized (codecLock) {
+            if (surface == null || !surface.isValid()) return;
+            if (!active || feedThread == null) {
+                active = true;
+                startNs = System.nanoTime();
+                feedThread = new Thread(this::feedLoop, "h264-feed");
+                feedThread.start();
+            }
+        }
 
-        try {
-            if (decoder == null || curW != w || curH != h) {
-                if (!isKey) return;
-                release();
-                MediaFormat fmt = MediaFormat.createVideoFormat("video/avc", w, h);
-                setCsdFromAnnexB(fmt, nal, off, len);
-                fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(512 * 1024, len * 2));
-                try { fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, 120); } catch (Exception ignored) {}
-                if (Build.VERSION.SDK_INT >= 30) {
-                    try { fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); } catch (Exception ignored) {}
+        FrameTask task = new FrameTask(w, h, isKey, nal, off, len);
+        if (isKey) {
+            // Limpiar P-frames atrasados para arrancar desde el keyframe nuevo
+            while (queue.size() > 2) {
+                FrameTask head = queue.peek();
+                if (head != null && !head.isKey) queue.poll();
+                else break;
+            }
+            if (!queue.offer(task)) {
+                queue.poll();
+                queue.offer(task);
+            }
+        } else {
+            if (!queue.offer(task)) {
+                // Descartar P-frame más antiguo si se llena la cola
+                FrameTask head = queue.peek();
+                if (head != null && !head.isKey) queue.poll();
+                queue.offer(task);
+            }
+        }
+    }
+
+    private void feedLoop() {
+        while (active) {
+            try {
+                FrameTask t = queue.take();
+                // Si hay varios P-frames acumulados detrás, saltar al más reciente si ninguno es keyframe
+                while (!t.isKey && queue.size() > 1) {
+                    FrameTask next = queue.peek();
+                    if (next != null && !next.isKey) {
+                        t = queue.take();
+                    } else {
+                        break;
+                    }
                 }
-                try { fmt.setInteger(MediaFormat.KEY_PRIORITY, 0); } catch (Exception ignored) {}
+                processFrame(t);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    }
 
-                decoder = MediaCodec.createDecoderByType("video/avc");
-                decoder.configure(fmt, surface, null, 0);
-                decoder.start();
-                curW = w;
-                curH = h;
-                waitingKey = false;
-                startDrainLoop(decoder);
+    private void processFrame(FrameTask t) {
+        try {
+            MediaCodec dec;
+            synchronized (codecLock) {
+                if (!active || surface == null || !surface.isValid()) return;
+                if (waitingKey && !t.isKey) return;
+
+                if (decoder == null || curW != t.w || curH != t.h) {
+                    if (!t.isKey) return;
+                    stopDecoderLocked();
+
+                    MediaFormat fmt = MediaFormat.createVideoFormat("video/avc", t.w, t.h);
+                    setCsdFromAnnexB(fmt, t.data, t.off, t.len);
+                    fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(512 * 1024, t.len * 2));
+                    try { fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, 120); } catch (Exception ignored) {}
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        try { fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); } catch (Exception ignored) {}
+                    }
+                    try { fmt.setInteger(MediaFormat.KEY_PRIORITY, 0); } catch (Exception ignored) {}
+
+                    decoder = MediaCodec.createDecoderByType("video/avc");
+                    decoder.configure(fmt, surface, null, 0);
+                    decoder.start();
+                    curW = t.w;
+                    curH = t.h;
+                    waitingKey = false;
+                    startDrainLoopLocked(decoder);
+                }
+                dec = decoder;
             }
 
-            int waitUs = isKey ? 20000 : 4000;
-            int inIdx = decoder.dequeueInputBuffer(waitUs);
+            if (dec == null) return;
+            int inIdx = dec.dequeueInputBuffer(t.isKey ? 20000 : 5000);
             if (inIdx >= 0) {
-                ByteBuffer inBuf = decoder.getInputBuffer(inIdx);
+                ByteBuffer inBuf = dec.getInputBuffer(inIdx);
                 if (inBuf != null) {
                     inBuf.clear();
-                    inBuf.put(nal, off, len);
-                    ptsUs += 16666;
-                    int flags = isKey ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
-                    decoder.queueInputBuffer(inIdx, 0, len, ptsUs, flags);
+                    inBuf.put(t.data, t.off, t.len);
+                    long ptsUs = Math.max(0L, (System.nanoTime() - startNs) / 1000L);
+                    int flags = t.isKey ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                    dec.queueInputBuffer(inIdx, 0, t.len, ptsUs, flags);
                 }
             }
         } catch (Exception e) {
             String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-            release();
+            synchronized (codecLock) {
+                stopDecoderLocked();
+                waitingKey = true;
+            }
             if (callback != null) callback.onError("MediaCodec: " + msg);
         }
     }
 
-    private void startDrainLoop(final MediaCodec codecRef) {
-        draining = true;
+    private void stopDecoderLocked() {
+        Thread dt = drainThread;
+        MediaCodec dec = decoder;
+        drainThread = null;
+        decoder = null;
+        if (dt != null) dt.interrupt();
+        if (dec != null) {
+            try { dec.stop(); } catch (Exception ignored) {}
+            try { dec.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void startDrainLoopLocked(final MediaCodec codecRef) {
         drainThread = new Thread(() -> {
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-            while (draining) {
+            while (active) {
                 try {
                     int outIdx = codecRef.dequeueOutputBuffer(info, 20000);
                     if (outIdx >= 0) {
@@ -126,7 +231,7 @@ public class H264Renderer {
                 } catch (IllegalStateException e) {
                     break;
                 } catch (Exception e) {
-                    if (draining && callback != null) {
+                    if (active && callback != null) {
                         callback.onError("Drain: " + e.getMessage());
                     }
                     break;

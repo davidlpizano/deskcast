@@ -18,6 +18,7 @@ from red_remota import (  # noqa: E402
     activar_adb_reverse,
     activar_hotspot,
     comando_instalar_tailscale,
+    configurar_usb_tether_sin_ruta_default,
     desactivar_hotspot,
     detectar_redes,
     estado_adb,
@@ -35,7 +36,7 @@ class DeskCastWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title=f'DeskCast v{ver} · 2º Monitor Wayland')
         self.set_default_size(900, 680)
         self.set_icon_name('deskcast')
-        self.server = DeskCastServer(codec='h264', bitrate=4000)
+        self.server = DeskCastServer(codec='h264', bitrate=6000, fps=60)
         self._qr_url_actual = ''
         self._syncing_preset = False
 
@@ -76,12 +77,12 @@ class DeskCastWindow(Adw.ApplicationWindow):
 
         self.row_preset = Adw.ComboRow(title='Perfil de rendimiento')
         self.row_preset.set_model(Gtk.StringList.new([
-            'Equilibrado (1280×800 · H.264 4000 kbps)',
+            'Equilibrado (1280×800 · 30 FPS · H.264 4000 kbps)',
             '⚡ Ultra Fluido (1280×800 · 60 FPS · H.264 6000 kbps)',
             '🎨 Nítido / Lectura (1920×1200 · 30 FPS · H.264 8000 kbps)',
             '📱 Ahorro 4G / Remoto (1024×640 · 25 FPS · Turbo Tiles)',
         ]))
-        self.row_preset.set_selected(0)
+        self.row_preset.set_selected(1)
         self.row_preset.connect('notify::selected', self._on_preset_change)
         grp_mon.add(self.row_preset)
 
@@ -110,7 +111,7 @@ class DeskCastWindow(Adw.ApplicationWindow):
 
         self.row_fps = Adw.SpinRow.new_with_range(10, 60, 1)
         self.row_fps.set_title('FPS objetivo (24 / 30 / 60)')
-        self.row_fps.set_value(30)
+        self.row_fps.set_value(60)
         self.row_fps.connect('notify::value', self._on_cfg_change)
         grp_str.add(self.row_fps)
 
@@ -140,7 +141,7 @@ class DeskCastWindow(Adw.ApplicationWindow):
 
         self.row_bitrate = Adw.SpinRow.new_with_range(1000, 12000, 500)
         self.row_bitrate.set_title('Bitrate H.264 (kbps)')
-        self.row_bitrate.set_value(4000)
+        self.row_bitrate.set_value(6000)
         self.row_bitrate.connect('notify::value', self._on_cfg_change)
         grp_str.add(self.row_bitrate)
 
@@ -360,8 +361,11 @@ class DeskCastWindow(Adw.ApplicationWindow):
         self.row_ts.set_subtitle(f'Conectado ({ts_ip})' if ts_st == 'conectado' else ('Instalado, sin conectar' if ts_st == 'desconectado' else 'No instalado'))
         self.row_wg.set_subtitle(f'Conectado ({wg_ip})' if wg_st == 'conectado' else ('Listo (/etc/wireguard/wg0.conf)' if wg_st == 'configurado_inactivo' else 'Instalado (sin túnel wg0 activo)'))
 
+        usb_tether_ok, usb_tether_ip, _ = configurar_usb_tether_sin_ruta_default()
         nets = detectar_redes()
         items = []
+        if usb_tether_ok and usb_tether_ip:
+            items.append((f'Anclaje USB (directo <1ms): {proto}://{usb_tether_ip}:{self.server.port}', f'{proto}://{usb_tether_ip}:{self.server.port}'))
         if usb_ready:
             items.append((f'Cable USB (ADB): {proto}://127.0.0.1:{self.server.port}', f'{proto}://127.0.0.1:{self.server.port}'))
         for iface, ip in nets['lan']:

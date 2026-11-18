@@ -368,10 +368,10 @@ class DeskCastServer:
 
         p_enc = (
             f'appsrc name=enc_src is-live=true format=time '
-            f'caps=video/x-raw,format=I420,width={w},height={h},framerate=30/1 ! '
-            f'x264enc name=venc tune=zerolatency speed-preset=superfast bitrate={self.bitrate} '
-            f'vbv-buf-capacity=100 qp-min=10 qp-max=34 '
-            f'key-int-max=120 bframes=0 threads=4 sliced-threads=true rc-lookahead=0 ! '
+            f'caps=video/x-raw,format=I420,width={w},height={h},framerate={self.fps}/1 ! '
+            f'x264enc name=venc tune=zerolatency speed-preset=ultrafast bitrate={self.bitrate} '
+            f'vbv-buf-capacity=300 qp-min=10 qp-max=36 '
+            f'key-int-max=300 bframes=0 threads=4 sliced-threads=true rc-lookahead=0 ! '
             f'h264parse config-interval=-1 ! '
             f'video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! '
             f'appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false'
@@ -406,9 +406,12 @@ class DeskCastServer:
     def _h264_pacer_loop(self):
         t0 = time.monotonic()
         last_push = 0.0
+        next_tick = t0
         while self._pacer_running and self.running and self.codec == 'h264':
             interval = 1.0 / max(1, self.fps)
-            woke = self._cap_event.wait(timeout=interval)
+            now = time.monotonic()
+            wait_s = max(0.001, next_tick - now)
+            self._cap_event.wait(timeout=wait_s)
             if not (self._pacer_running and self.running):
                 break
             now = time.monotonic()
@@ -416,19 +419,22 @@ class DeskCastServer:
                 item = self._latest_i420
                 if item is None:
                     self._cap_event.clear()
+                    next_tick = now + interval
                     continue
                 buf, w, h, is_fresh = item
                 if is_fresh:
+                    # Evita ráfagas de <0.45*interval que generan micro-tirones
+                    if (now - last_push) < interval * 0.45:
+                        self._cap_event.clear()
+                        continue
                     self._latest_i420 = (buf, w, h, False)
                     self._cap_event.clear()
 
             if not is_fresh and not self.keep_fps:
+                next_tick = now + interval
                 continue
-            if not is_fresh and (now - last_push) < interval * 0.9:
+            if not is_fresh and now < next_tick - 0.001:
                 continue
-            # Evita exceso si Mutter manda ráfagas > fps configurados
-            if is_fresh and (now - last_push) < (0.75 / max(1, self.fps)):
-                pass
 
             try:
                 self._ensure_h264_encoder(w, h)
@@ -437,6 +443,7 @@ class DeskCastServer:
                 push_buf.duration = int(interval * Gst.SECOND)
                 self.enc_src.emit('push-buffer', push_buf)
                 last_push = now
+                next_tick = now + interval
             except Exception as exc:
                 self._notify_status(f'Error encoder H.264: {exc}')
                 time.sleep(0.1)

@@ -135,6 +135,26 @@ def activar_adb_reverse(port=8765):
     return False, (err or out or 'Error ejecutando adb reverse')
 
 
+def configurar_usb_tether_sin_ruta_default():
+    """Si hay anclaje USB activo (usb0/enx*), evita que robe la salida a Internet del PC y devuelve su IP."""
+    if not shutil.which('nmcli'):
+        return False, None, 'Falta nmcli'
+    rc, out, _ = _run(['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE', 'connection', 'show', '--active'], timeout=3)
+    if rc != 0:
+        return False, None, 'No se pudo consultar NetworkManager'
+    for line in out.splitlines():
+        parts = line.split(':')
+        if len(parts) >= 3 and parts[1] == '802-3-ethernet':
+            name, dev = parts[0], parts[2]
+            if dev.startswith('usb') or dev.startswith('enx'):
+                _run(['nmcli', 'connection', 'modify', name, 'ipv4.never-default', 'yes', 'ipv6.never-default', 'yes'], timeout=3)
+                _run(['nmcli', 'connection', 'up', name], timeout=5)
+                rc2, ip_out, _ = _run(['ip', '-o', '-4', 'addr', 'show', dev], timeout=2)
+                ip = ip_out.split()[3].split('/')[0] if rc2 == 0 and ip_out else None
+                return True, ip, f'{dev} ({ip})'
+    return False, None, 'No hay interfaz USB Tethering activa'
+
+
 def find_wifi_iface():
     """Devuelve el nombre de la interfaz Wi-Fi (ej. wlp1s0) o None."""
     if not shutil.which('nmcli'):

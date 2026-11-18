@@ -66,6 +66,7 @@ public class WsClient {
         Socket raw = new Socket();
         raw.setTcpNoDelay(true);
         raw.setKeepAlive(true);
+        try { raw.setTrafficClass(0x10); } catch (Exception ignored) {}
         raw.setReceiveBufferSize(512 * 1024);
         raw.connect(new InetSocketAddress(host, port), 5000);
         if (!useTls) return raw;
@@ -89,7 +90,7 @@ public class WsClient {
         try {
             socket = createSocket();
             socket.setSoTimeout(6000);
-            InputStream in = new BufferedInputStream(socket.getInputStream(), 65536);
+            InputStream in = new BufferedInputStream(socket.getInputStream(), 128 * 1024);
             out = socket.getOutputStream();
 
             byte[] keyBytes = new byte[16];
