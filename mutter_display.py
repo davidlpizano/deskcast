@@ -35,6 +35,7 @@ class MutterVirtualMonitor:
         self.node_id = None
         self._sub_id = None
         self._closed_sub_id = None
+        self.virt_origin = None
         self.running = False
 
     def _has_active_virtual_monitor(self):
@@ -251,6 +252,7 @@ class MutterVirtualMonitor:
                 GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', (serial, 1, cfg, {})),
                 None, Gio.DBusCallFlags.NONE, -1, None,
             )
+            self.virt_origin = (int(vx), int(vy))
             return True
         except Exception:
             return False

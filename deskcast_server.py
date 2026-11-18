@@ -168,6 +168,122 @@ class ClientSession:
             return False
 
 
+class _X11WakePixel:
+    """
+    Ventana 1×1 click-through en la esquina de Meta-0 para mantener activo el reloj
+    de composición de Mutter (evita que el cursor vaya a ~3 FPS cuando no hay daño de ventana).
+    """
+
+    class _XSetWindowAttributes(ctypes.Structure):
+        _fields_ = [
+            ('background_pixmap', ctypes.c_ulong), ('background_pixel', ctypes.c_ulong),
+            ('border_pixmap', ctypes.c_ulong), ('border_pixel', ctypes.c_ulong),
+            ('bit_gravity', ctypes.c_int), ('win_gravity', ctypes.c_int),
+            ('backing_store', ctypes.c_int), ('backing_planes', ctypes.c_ulong),
+            ('backing_pixel', ctypes.c_ulong), ('save_under', ctypes.c_int),
+            ('event_mask', ctypes.c_long), ('do_not_propagate_mask', ctypes.c_long),
+            ('override_redirect', ctypes.c_int), ('colormap', ctypes.c_ulong),
+            ('cursor', ctypes.c_ulong),
+        ]
+
+    def __init__(self):
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
+        self._x = 0
+        self._y = 0
+        self._fps = 60
+        self._moved = False
+
+    def start(self, x: int, y: int, fps: int = 60):
+        with self._lock:
+            self._x = int(x)
+            self._y = int(y)
+            self._fps = max(10, min(60, int(fps)))
+            self._moved = True
+            if self._running:
+                return
+            self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_fps(self, fps: int):
+        with self._lock:
+            self._fps = max(10, min(60, int(fps)))
+
+    def stop(self):
+        with self._lock:
+            self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.4)
+        self._thread = None
+
+    def _run(self):
+        disp_name = os.environ.get('DISPLAY', ':0').encode('ascii', errors='ignore')
+        try:
+            x11 = ctypes.CDLL('libX11.so.6')
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            dpy = x11.XOpenDisplay(disp_name)
+            if not dpy:
+                return
+        except Exception:
+            return
+
+        win = 0
+        try:
+            root = x11.XDefaultRootWindow(ctypes.c_void_p(dpy))
+            attrs = self._XSetWindowAttributes()
+            attrs.override_redirect = 1
+            attrs.background_pixel = 0x010101
+            with self._lock:
+                wx, wy = self._x, self._y
+                self._moved = False
+            win = x11.XCreateWindow(
+                ctypes.c_void_p(dpy), ctypes.c_ulong(root), wx, wy, 1, 1, 0,
+                0, 1, None, (1 << 1) | (1 << 9), ctypes.byref(attrs),
+            )
+            if not win:
+                return
+            try:
+                xf = ctypes.CDLL('libXfixes.so.3')
+                xf.XFixesCreateRegion.restype = ctypes.c_ulong
+                reg = xf.XFixesCreateRegion(ctypes.c_void_p(dpy), None, 0)
+                if reg:
+                    # ShapeInput = 2 -> ventana 100% click-through
+                    xf.XFixesSetWindowShapeRegion(ctypes.c_void_p(dpy), ctypes.c_ulong(win), 2, 0, 0, ctypes.c_ulong(reg))
+                    xf.XFixesDestroyRegion(ctypes.c_void_p(dpy), ctypes.c_ulong(reg))
+            except Exception:
+                pass
+            x11.XMapWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(win))
+            x11.XFlush(ctypes.c_void_p(dpy))
+
+            tick = 0
+            while True:
+                with self._lock:
+                    if not self._running:
+                        break
+                    fps = self._fps
+                    moved = self._moved
+                    nx, ny = self._x, self._y
+                    self._moved = False
+                if moved:
+                    x11.XMoveWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(win), nx, ny)
+                tick ^= 1
+                x11.XSetWindowBackground(ctypes.c_void_p(dpy), ctypes.c_ulong(win), 0x010101 if tick else 0x020202)
+                x11.XClearWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(win))
+                x11.XFlush(ctypes.c_void_p(dpy))
+                time.sleep(1.0 / max(10, fps))
+        except Exception:
+            pass
+        finally:
+            try:
+                if win:
+                    x11.XDestroyWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(win))
+                x11.XCloseDisplay(ctypes.c_void_p(dpy))
+            except Exception:
+                pass
+
+
 class DeskCastServer:
     """Controlador principal del monitor virtual, captura diferencial C/JPEG o H.264 y HTTP/WS."""
 
@@ -192,6 +308,7 @@ class DeskCastServer:
         self.pipeline = None
         self.pwsrc = None
         self.x264enc = None
+        self._wake_pixel = _X11WakePixel()
         self.glib_loop = None
         self.glib_thread = None
         self.aio_loop = None
@@ -278,6 +395,7 @@ class DeskCastServer:
         GLib.idle_add(self._start_display)
 
     def _stop_display(self):
+        self._wake_pixel.stop()
         if self.pipeline:
             try:
                 self.pipeline.set_state(Gst.State.NULL)
@@ -333,6 +451,9 @@ class DeskCastServer:
                 self.pwsrc = None
                 self.x264enc = None
                 self._launch_pipeline(nid)
+            if ok and not self.mirror and self.codec == 'h264' and self.monitor.virt_origin:
+                vx, vy = self.monitor.virt_origin
+                self._wake_pixel.start(vx + 2, vy + 2, fps=self.fps)
         return False
 
     def _force_h264_keyframe(self):
@@ -597,6 +718,7 @@ class DeskCastServer:
                 GLib.idle_add(lambda: (self.x264enc.set_property('bitrate', br) if self.x264enc else None) and False)
         if fps is not None:
             self.fps = max(5, min(60, int(fps)))
+            self._wake_pixel.set_fps(self.fps)
         if quality is not None:
             self.quality = max(25, min(95, int(quality)))
         if pin is not None:

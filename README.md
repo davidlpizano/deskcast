@@ -1,4 +1,4 @@
-# DeskCast v1.0.0 · Usa tu tablet como 2º monitor en Linux (GNOME Wayland)
+# DeskCast v1.0.1 · Usa tu tablet como 2º monitor en Linux (GNOME Wayland)
 
 **DeskCast** convierte tu tablet Android (o cualquier navegador) en un **segundo monitor extendido real** en Linux (GNOME Wayland) a **60 FPS**, sin conectores HDMI falsos y con control táctil, ratón y teclado.
 
@@ -6,14 +6,14 @@ Funciona por **Hotspot Wi-Fi directo (5 GHz)**, **cable USB**, **red local** o *
 
 ---
 
-## Descarga oficial (Versión 1.0.0)
+## Descarga oficial (Última versión)
 
-Ve a la sección **[Releases v1.0.0](https://github.com/davidlpizano/deskcast/releases/latest)** y descarga el archivo según tu dispositivo:
+Ve a la sección **[Releases](https://github.com/davidlpizano/deskcast/releases/latest)** y descarga el archivo según tu dispositivo:
 
 | Dispositivo | Archivo a descargar | Qué hace |
 | :--- | :--- | :--- |
-| **PC Linux (Ubuntu / Debian)** | `deskcast_1.0.0_amd64.deb` | Instala DeskCast y todas sus dependencias en tu sistema |
-| **PC Linux (otra distro / portátil)** | `deskcast-linux-v1.0.0.tar.gz` | Carpeta lista para ejecutar con `./instalar.sh` |
+| **PC Linux (Ubuntu / Debian)** | `deskcast_<version>_amd64.deb` | Instala DeskCast y todas sus dependencias en tu sistema |
+| **PC Linux (otra distro / portátil)** | `deskcast-linux-v<version>.tar.gz` | Carpeta lista para ejecutar con `./instalar.sh` |
 | **Tablet / Móvil Android (8.0+)** | `DeskCast.apk` | App nativa ultra fluida con decodificación H.264 por hardware |
 
 *(Si prefieres usar la tablet **sin instalar ninguna app**, también puedes conectarte abriendo la URL de DeskCast desde Chrome/Brave).*
