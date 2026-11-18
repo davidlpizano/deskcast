@@ -48,7 +48,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private EditText kbdBridge;
     private LinearLayout panelWrap;
     private EditText editHost, editPort, editPin;
-    private CheckBox chkHttps, chkTrackpad;
+    private CheckBox chkHttps, chkTrackpad, chkTouchScroll;
     private Spinner spinRes, spinPos, spinBitrate;
     private Button btnMirror, btnRClick;
 
@@ -92,6 +92,55 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean scrolling2F = false;
     private double trackX = 0.5, trackY = 0.5;
     private float lastTouchX = 0, lastTouchY = 0;
+    private int activeBtn = 0;
+
+    private static final int TOUCH_NONE = 0;
+    private static final int TOUCH_PENDING = 1;
+    private static final int TOUCH_SCROLL = 2;
+    private static final int TOUCH_DRAG = 3;
+    private int touchMode = TOUCH_NONE;
+    private float downX = 0, downY = 0, prevTouchX = 0, prevTouchY = 0;
+    private double downNx = 0.5, downNy = 0.5;
+    private float pendingSdx = 0f, pendingSdy = 0f;
+    private float velSdx = 0f, velSdy = 0f;
+    private long lastScrollSampleMs = 0L;
+    private long lastScrollSendMs = 0L;
+    private float flingSdx = 0f, flingSdy = 0f;
+    private int flingSteps = 0;
+
+    private final Runnable longPressTask = () -> {
+        if (touchMode != TOUCH_PENDING || ws == null) return;
+        touchMode = TOUCH_DRAG;
+        activeBtn = rightClickArmed ? 2 : 0;
+        if (rightClickArmed) {
+            rightClickArmed = false;
+            btnRClick.setText("Clic der.");
+        }
+        try {
+            surfaceView.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+        } catch (Exception ignored) {}
+        ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + downNx + ",\"y\":" + downNy + ",\"button\":" + activeBtn + "}");
+    };
+
+    private final Runnable flingTask = new Runnable() {
+        @Override
+        public void run() {
+            if (ws == null || flingSteps <= 0 || (Math.abs(flingSdx) < 0.12f && Math.abs(flingSdy) < 0.12f)) {
+                flingSteps = 0;
+                return;
+            }
+            ws.sendText("{\"type\":\"pointer\",\"action\":\"scroll\",\"dx\":" + flingSdx + ",\"dy\":" + flingSdy + "}");
+            flingSdx *= 0.84f;
+            flingSdy *= 0.84f;
+            flingSteps--;
+            ui.postDelayed(this, 16);
+        }
+    };
+
+    private void stopFling() {
+        flingSteps = 0;
+        ui.removeCallbacks(flingTask);
+    }
 
     private final Runnable statsTick = new Runnable() {
         @Override
@@ -287,7 +336,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         chkTrackpad.setText("Trackpad");
         chkTrackpad.setTextColor(Color.WHITE);
         chkTrackpad.setChecked(sp.getBoolean("trackpad", false));
+        chkTrackpad.setOnCheckedChangeListener((b, c) ->
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("trackpad", c).apply()
+        );
         rowPin.addView(chkTrackpad);
+
+        chkTouchScroll = new CheckBox(this);
+        chkTouchScroll.setText("Scroll 1 dedo");
+        chkTouchScroll.setTextColor(Color.WHITE);
+        chkTouchScroll.setChecked(sp.getBoolean("touch_scroll", true));
+        chkTouchScroll.setOnCheckedChangeListener((b, c) ->
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("touch_scroll", c).apply()
+        );
+        rowPin.addView(chkTouchScroll);
         card.addView(rowPin);
 
         LinearLayout rowOpts = new LinearLayout(this);
@@ -519,6 +580,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 .putString("pin", pin)
                 .putBoolean("https", tls)
                 .putBoolean("trackpad", chkTrackpad.isChecked())
+                .putBoolean("touch_scroll", chkTouchScroll != null && chkTouchScroll.isChecked())
                 .apply();
         }
 
@@ -686,14 +748,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int vw = Math.max(1, surfaceView.getWidth());
         int vh = Math.max(1, surfaceView.getHeight());
         boolean trackpad = chkTrackpad != null && chkTrackpad.isChecked();
+        boolean touchScroll = chkTouchScroll == null || chkTouchScroll.isChecked();
 
         int action = ev.getActionMasked();
         if (ev.getPointerCount() >= 2) {
+            ui.removeCallbacks(longPressTask);
+            stopFling();
+            if (touchMode == TOUCH_DRAG) {
+                double cx = Math.max(0.0, Math.min(1.0, ev.getX() / vw));
+                double cy = Math.max(0.0, Math.min(1.0, ev.getY() / vh));
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + cx + ",\"y\":" + cy + ",\"button\":" + activeBtn + "}");
+            }
+            touchMode = TOUCH_NONE;
             if (action == MotionEvent.ACTION_POINTER_DOWN) {
                 scrolling2F = true;
                 prevScrollY = ev.getY();
             } else if (action == MotionEvent.ACTION_MOVE && scrolling2F) {
-                float dy = (prevScrollY - ev.getY()) * 0.15f;
+                float dy = (prevScrollY - ev.getY()) * (180.0f / Math.max(400, vh));
                 prevScrollY = ev.getY();
                 ws.sendText("{\"type\":\"pointer\",\"action\":\"scroll\",\"dx\":0,\"dy\":" + dy + "}");
             }
@@ -701,16 +772,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         if (trackpad) {
+            ui.removeCallbacks(longPressTask);
+            stopFling();
+            touchMode = TOUCH_NONE;
             if (action == MotionEvent.ACTION_DOWN) {
                 scrolling2F = false;
                 lastTouchX = ev.getX();
                 lastTouchY = ev.getY();
-                int btn = rightClickArmed ? 2 : 0;
+                activeBtn = rightClickArmed ? 2 : 0;
                 if (rightClickArmed) {
                     rightClickArmed = false;
                     btnRClick.setText("Clic der.");
                 }
-                ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + trackX + ",\"y\":" + trackY + ",\"button\":" + btn + "}");
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + trackX + ",\"y\":" + trackY + ",\"button\":" + activeBtn + "}");
             } else if (action == MotionEvent.ACTION_MOVE && !scrolling2F) {
                 long now = System.currentTimeMillis();
                 float dx = ev.getX() - lastTouchX;
@@ -727,30 +801,140 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
             } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                 scrolling2F = false;
-                ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + trackX + ",\"y\":" + trackY + ",\"button\":0}");
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + trackX + ",\"y\":" + trackY + ",\"button\":" + activeBtn + "}");
+                activeBtn = 0;
             }
             return true;
         }
 
         double nx = Math.max(0.0, Math.min(1.0, ev.getX() / vw));
         double ny = Math.max(0.0, Math.min(1.0, ev.getY() / vh));
-        if (action == MotionEvent.ACTION_DOWN) {
-            scrolling2F = false;
-            int btn = rightClickArmed ? 2 : 0;
-            if (rightClickArmed) {
-                rightClickArmed = false;
-                btnRClick.setText("Clic der.");
+
+        if (!touchScroll) {
+            if (action == MotionEvent.ACTION_DOWN) {
+                scrolling2F = false;
+                activeBtn = rightClickArmed ? 2 : 0;
+                if (rightClickArmed) {
+                    rightClickArmed = false;
+                    btnRClick.setText("Clic der.");
+                }
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + activeBtn + "}");
+            } else if (action == MotionEvent.ACTION_MOVE && !scrolling2F) {
+                long now = System.currentTimeMillis();
+                if (now - lastMoveTs >= 7) {
+                    lastMoveTs = now;
+                    ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + nx + ",\"y\":" + ny + "}");
+                }
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                scrolling2F = false;
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + activeBtn + "}");
+                activeBtn = 0;
             }
-            ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + btn + "}");
+            return true;
+        }
+
+        // Modo Táctil Inteligente: 1 dedo deslizar = Scroll (con inercia), toque = Clic, mantener = Seleccionar/Arrastrar
+        if (action == MotionEvent.ACTION_DOWN) {
+            stopFling();
+            scrolling2F = false;
+            downX = prevTouchX = ev.getX();
+            downY = prevTouchY = ev.getY();
+            downNx = nx;
+            downNy = ny;
+            pendingSdx = 0f;
+            pendingSdy = 0f;
+            velSdx = 0f;
+            velSdy = 0f;
+            lastScrollSampleMs = 0L;
+            lastScrollSendMs = 0L;
+            touchMode = TOUCH_PENDING;
+            ui.removeCallbacks(longPressTask);
+            ui.postDelayed(longPressTask, 360);
         } else if (action == MotionEvent.ACTION_MOVE && !scrolling2F) {
-            long now = System.currentTimeMillis();
-            if (now - lastMoveTs >= 7) {
-                lastMoveTs = now;
-                ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + nx + ",\"y\":" + ny + "}");
+            if (touchMode == TOUCH_PENDING) {
+                float dist = (float) Math.hypot(ev.getX() - downX, ev.getY() - downY);
+                if (dist >= dp(9)) {
+                    ui.removeCallbacks(longPressTask);
+                    touchMode = TOUCH_SCROLL;
+                    ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + downNx + ",\"y\":" + downNy + "}");
+                }
+            }
+            if (touchMode == TOUCH_SCROLL) {
+                float scale = 180.0f / Math.max(400, vh);
+                float sdx = (prevTouchX - ev.getX()) * scale;
+                float sdy = (prevTouchY - ev.getY()) * scale;
+                prevTouchX = ev.getX();
+                prevTouchY = ev.getY();
+                // Bloqueo de eje para evitar desplazamiento horizontal accidental al bajar documentos
+                if (Math.abs(ev.getX() - downX) < dp(24) && Math.abs(sdy) > Math.abs(sdx) * 1.3f) {
+                    sdx = 0f;
+                }
+                pendingSdx += sdx;
+                pendingSdy += sdy;
+                long now = System.currentTimeMillis();
+                if (lastScrollSampleMs > 0) {
+                    long dt = Math.max(4L, now - lastScrollSampleMs);
+                    float frameScale = 16.0f / dt;
+                    velSdx = velSdx * 0.55f + (sdx * frameScale) * 0.45f;
+                    velSdy = velSdy * 0.55f + (sdy * frameScale) * 0.45f;
+                } else {
+                    velSdx = sdx;
+                    velSdy = sdy;
+                }
+                lastScrollSampleMs = now;
+                if (now - lastScrollSendMs >= 8) {
+                    lastScrollSendMs = now;
+                    if (Math.abs(pendingSdx) > 0.01f || Math.abs(pendingSdy) > 0.01f) {
+                        ws.sendText("{\"type\":\"pointer\",\"action\":\"scroll\",\"dx\":" + pendingSdx + ",\"dy\":" + pendingSdy + "}");
+                        pendingSdx = 0f;
+                        pendingSdy = 0f;
+                    }
+                }
+            } else if (touchMode == TOUCH_DRAG) {
+                long now = System.currentTimeMillis();
+                if (now - lastMoveTs >= 7) {
+                    lastMoveTs = now;
+                    ws.sendText("{\"type\":\"pointer\",\"action\":\"move\",\"x\":" + nx + ",\"y\":" + ny + "}");
+                }
             }
         } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            scrolling2F = false;
-            ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":0}");
+            ui.removeCallbacks(longPressTask);
+            if (scrolling2F) {
+                scrolling2F = false;
+                touchMode = TOUCH_NONE;
+                return true;
+            }
+            if (touchMode == TOUCH_PENDING && action == MotionEvent.ACTION_UP) {
+                final int btn = rightClickArmed ? 2 : 0;
+                if (rightClickArmed) {
+                    rightClickArmed = false;
+                    btnRClick.setText("Clic der.");
+                }
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"down\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + btn + "}");
+                ui.postDelayed(() -> {
+                    if (ws != null) {
+                        ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + btn + "}");
+                    }
+                }, 25);
+            } else if (touchMode == TOUCH_SCROLL) {
+                if (Math.abs(pendingSdx) > 0.01f || Math.abs(pendingSdy) > 0.01f) {
+                    ws.sendText("{\"type\":\"pointer\",\"action\":\"scroll\",\"dx\":" + pendingSdx + ",\"dy\":" + pendingSdy + "}");
+                    pendingSdx = 0f;
+                    pendingSdy = 0f;
+                }
+                if (action == MotionEvent.ACTION_UP && (System.currentTimeMillis() - lastScrollSampleMs) < 65L) {
+                    if (Math.hypot(velSdx, velSdy) > 0.45) {
+                        flingSdx = velSdx;
+                        flingSdy = velSdy;
+                        flingSteps = 16;
+                        ui.postDelayed(flingTask, 16);
+                    }
+                }
+            } else if (touchMode == TOUCH_DRAG) {
+                ws.sendText("{\"type\":\"pointer\",\"action\":\"up\",\"x\":" + nx + ",\"y\":" + ny + ",\"button\":" + activeBtn + "}");
+                activeBtn = 0;
+            }
+            touchMode = TOUCH_NONE;
         }
         return true;
     }
@@ -820,6 +1004,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onDestroy() {
         userDisconnected = true;
+        stopFling();
+        ui.removeCallbacks(longPressTask);
         ui.removeCallbacks(statsTick);
         if (ws != null) ws.close();
         renderer.release();

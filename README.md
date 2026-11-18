@@ -1,4 +1,4 @@
-# DeskCast v1.0.2 · Usa tu tablet como 2º monitor en Linux (GNOME Wayland)
+# DeskCast v1.0.3 · Usa tu tablet como 2º monitor en Linux (GNOME Wayland)
 
 **DeskCast** convierte tu tablet Android (o cualquier navegador) en un **segundo monitor extendido real** en Linux (GNOME Wayland) a **60 FPS**, sin conectores HDMI falsos y con control táctil, ratón y teclado.
 
@@ -27,7 +27,7 @@ Ve a la sección **[Releases](https://github.com/davidlpizano/deskcast/releases/
 #### Opción A — Paquete `.deb` en Ubuntu / Debian (la más fácil)
 ```bash
 sudo apt update
-sudo apt install ./deskcast_1.0.2_amd64.deb
+sudo apt install ./deskcast_1.0.3_amd64.deb
 ```
 Después abre **DeskCast** desde tu menú de aplicaciones (o ejecuta `deskcast` en la terminal).
 
