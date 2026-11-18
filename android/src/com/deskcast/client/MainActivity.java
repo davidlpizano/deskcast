@@ -235,7 +235,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             chkHttps.setChecked(false);
         }));
         presets.addView(makeChip("Tailscale", () -> {
-            editHost.setText("100.108.59.33");
+            editHost.setText("100.");
+            editHost.setSelection(editHost.getText().length());
+            editHost.requestFocus();
             editPort.setText("8765");
             chkHttps.setChecked(false);
         }));
