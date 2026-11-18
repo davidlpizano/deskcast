@@ -31,7 +31,8 @@ public class H264Renderer {
     }
 
     private final Callback callback;
-    private final LinkedBlockingQueue<FrameTask> queue = new LinkedBlockingQueue<>(12);
+    // Cola amplia: NUNCA descartar P-frames sueltos en H.264 porque rompe la referencia de los siguientes frames
+    private final LinkedBlockingQueue<FrameTask> queue = new LinkedBlockingQueue<>(96);
     private final Object codecLock = new Object();
 
     private MediaCodec decoder;
@@ -41,7 +42,6 @@ public class H264Renderer {
     private volatile boolean active = false;
     private int curW = 0;
     private int curH = 0;
-    private boolean waitingKey = true;
     private volatile boolean sawKeyEnqueued = false;
     private long startNs = 0;
 
@@ -80,7 +80,6 @@ public class H264Renderer {
             decoder = null;
             curW = 0;
             curH = 0;
-            waitingKey = true;
             sawKeyEnqueued = false;
             queue.clear();
         }
@@ -113,23 +112,13 @@ public class H264Renderer {
 
         FrameTask task = new FrameTask(w, h, isKey, nal, off, len);
         if (isKey) {
-            // Limpiar P-frames atrasados para arrancar desde el keyframe nuevo
-            while (queue.size() > 2) {
-                FrameTask head = queue.peek();
-                if (head != null && !head.isKey) queue.poll();
-                else break;
-            }
-            if (!queue.offer(task)) {
-                queue.poll();
-                queue.offer(task);
-            }
-        } else {
-            if (!queue.offer(task)) {
-                // Descartar P-frame más antiguo si se llena la cola
-                FrameTask head = queue.peek();
-                if (head != null && !head.isKey) queue.poll();
-                queue.offer(task);
-            }
+            // Si llega un keyframe nuevo y hay cola atrasada, se puede limpiar todo hasta él sin romper nada
+            if (queue.size() > 4) queue.clear();
+            queue.offer(task);
+        } else if (!queue.offer(task)) {
+            // Si la cola de 96 frames se llenara por bloqueo extremo, esperar al siguiente keyframe
+            sawKeyEnqueued = false;
+            queue.clear();
         }
     }
 
@@ -137,15 +126,6 @@ public class H264Renderer {
         while (active) {
             try {
                 FrameTask t = queue.take();
-                // Si hay varios P-frames acumulados detrás, saltar al más reciente si ninguno es keyframe
-                while (!t.isKey && queue.size() > 1) {
-                    FrameTask next = queue.peek();
-                    if (next != null && !next.isKey) {
-                        t = queue.take();
-                    } else {
-                        break;
-                    }
-                }
                 processFrame(t);
             } catch (InterruptedException e) {
                 break;
@@ -158,7 +138,6 @@ public class H264Renderer {
             MediaCodec dec;
             synchronized (codecLock) {
                 if (!active || surface == null || !surface.isValid()) return;
-                if (waitingKey && !t.isKey) return;
 
                 if (decoder == null || curW != t.w || curH != t.h) {
                     if (!t.isKey) return;
@@ -178,14 +157,13 @@ public class H264Renderer {
                     decoder.start();
                     curW = t.w;
                     curH = t.h;
-                    waitingKey = false;
                     startDrainLoopLocked(decoder);
                 }
                 dec = decoder;
             }
 
             if (dec == null) return;
-            int inIdx = dec.dequeueInputBuffer(t.isKey ? 20000 : 5000);
+            int inIdx = dec.dequeueInputBuffer(30000);
             if (inIdx >= 0) {
                 ByteBuffer inBuf = dec.getInputBuffer(inIdx);
                 if (inBuf != null) {
@@ -200,7 +178,7 @@ public class H264Renderer {
             String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             synchronized (codecLock) {
                 stopDecoderLocked();
-                waitingKey = true;
+                sawKeyEnqueued = false;
             }
             if (callback != null) callback.onError("MediaCodec: " + msg);
         }

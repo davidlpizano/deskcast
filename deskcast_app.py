@@ -548,7 +548,7 @@ class DeskCastWindow(Adw.ApplicationWindow):
         bw = f'{kbps / 1000:.1f} Mbps' if kbps > 1000 else f'{kbps} kbps'
         clients = [c for c in list(self.server.clients) if not c.closed]
         self.lbl_stats.set_text(
-            f'Tablets: {len(clients)} · {self.server.actual_fps} FPS · {bw}'
+            f'Tablets: {len(clients)} · {self.server.actual_fps} FPS (Mutter: {self.server.cap_fps}) · {bw}'
         )
         if clients:
             ips = ', '.join(str(c.peer[0]) for c in clients if c.peer)
