@@ -173,7 +173,7 @@ class DeskCastServer:
 
     def __init__(self, host='0.0.0.0', port=8765, width=1280, height=800,
                  fps=30, quality=58, position='right', mirror=False, pin='',
-                 codec='tiles', use_https=False, bitrate=4000):
+                 codec='tiles', use_https=False, bitrate=4000, keep_fps=True):
         self.host = host
         self.port = int(port)
         self.width = int(width)
@@ -186,10 +186,18 @@ class DeskCastServer:
         self.codec = codec  # 'tiles' (RGB->Dirty Tiles JPEG) o 'h264'
         self.use_https = bool(use_https)
         self.bitrate = max(500, min(15000, int(bitrate)))
+        self.keep_fps = bool(keep_fps)
 
         self.monitor = None
         self.pipeline = None
+        self.enc_pipeline = None
+        self.enc_src = None
         self.x264enc = None
+        self._cap_lock = threading.Lock()
+        self._cap_event = threading.Event()
+        self._latest_i420 = None
+        self._pacer_running = False
+        self._pacer_thread = None
         self.glib_loop = None
         self.glib_thread = None
         self.aio_loop = None
@@ -272,6 +280,18 @@ class DeskCastServer:
         GLib.idle_add(self._start_display)
 
     def _stop_display(self):
+        self._pacer_running = False
+        self._cap_event.set()
+        if self._pacer_thread and self._pacer_thread.is_alive():
+            self._pacer_thread.join(timeout=1.0)
+        self._pacer_thread = None
+        if self.enc_pipeline:
+            try:
+                self.enc_pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self.enc_pipeline = None
+            self.enc_src = None
         if self.pipeline:
             try:
                 self.pipeline.set_state(Gst.State.NULL)
@@ -279,6 +299,8 @@ class DeskCastServer:
                 pass
             self.pipeline = None
             self.x264enc = None
+        with self._cap_lock:
+            self._latest_i420 = None
         if self.monitor:
             try:
                 self.monitor.stop()
@@ -320,16 +342,104 @@ class DeskCastServer:
         return False
 
     def _force_h264_keyframe(self):
-        if not self.pipeline or GstVideo is None:
+        target = self.enc_pipeline or self.pipeline
+        if not target or GstVideo is None:
             return False
         try:
             ev = GstVideo.video_event_new_downstream_force_key_unit(
                 Gst.CLOCK_TIME_NONE, Gst.CLOCK_TIME_NONE, Gst.CLOCK_TIME_NONE, True, 0
             )
-            self.pipeline.send_event(ev)
+            target.send_event(ev)
         except Exception:
             pass
         return False
+
+    def _ensure_h264_encoder(self, w: int, h: int):
+        if self.enc_pipeline and getattr(self, '_enc_wh', None) == (w, h):
+            return
+        if self.enc_pipeline:
+            try:
+                self.enc_pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self.enc_pipeline = None
+            self.enc_src = None
+            self.x264enc = None
+
+        p_enc = (
+            f'appsrc name=enc_src is-live=true format=time '
+            f'caps=video/x-raw,format=I420,width={w},height={h},framerate=30/1 ! '
+            f'x264enc name=venc tune=zerolatency speed-preset=superfast bitrate={self.bitrate} '
+            f'vbv-buf-capacity=100 qp-min=10 qp-max=34 '
+            f'key-int-max=120 bframes=0 threads=4 sliced-threads=true rc-lookahead=0 ! '
+            f'h264parse config-interval=-1 ! '
+            f'video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! '
+            f'appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false'
+        )
+        ep = Gst.parse_launch(p_enc)
+        self.enc_src = ep.get_by_name('enc_src')
+        self.x264enc = ep.get_by_name('venc')
+        sink = ep.get_by_name('sink')
+        sink.connect('new-sample', self._on_gst_sample)
+        gbus = ep.get_bus()
+        gbus.add_signal_watch()
+        gbus.connect('message::error', self._on_gst_error)
+        ep.set_state(Gst.State.PLAYING)
+        self.enc_pipeline = ep
+        self._enc_wh = (w, h)
+
+    def _on_capture_sample(self, sink):
+        sample = sink.emit('pull-sample')
+        if not sample:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        st = sample.get_caps().get_structure(0)
+        ok_w, cw = st.get_int('width')
+        ok_h, ch = st.get_int('height')
+        w = cw if ok_w else self.width
+        h = ch if ok_h else self.height
+        with self._cap_lock:
+            self._latest_i420 = (buf, w, h, True)
+        self._cap_event.set()
+        return Gst.FlowReturn.OK
+
+    def _h264_pacer_loop(self):
+        t0 = time.monotonic()
+        last_push = 0.0
+        while self._pacer_running and self.running and self.codec == 'h264':
+            interval = 1.0 / max(1, self.fps)
+            woke = self._cap_event.wait(timeout=interval)
+            if not (self._pacer_running and self.running):
+                break
+            now = time.monotonic()
+            with self._cap_lock:
+                item = self._latest_i420
+                if item is None:
+                    self._cap_event.clear()
+                    continue
+                buf, w, h, is_fresh = item
+                if is_fresh:
+                    self._latest_i420 = (buf, w, h, False)
+                    self._cap_event.clear()
+
+            if not is_fresh and not self.keep_fps:
+                continue
+            if not is_fresh and (now - last_push) < interval * 0.9:
+                continue
+            # Evita exceso si Mutter manda ráfagas > fps configurados
+            if is_fresh and (now - last_push) < (0.75 / max(1, self.fps)):
+                pass
+
+            try:
+                self._ensure_h264_encoder(w, h)
+                push_buf = buf.copy_region(Gst.BufferCopyFlags.MEMORY, 0, buf.get_size())
+                push_buf.pts = int((now - t0) * Gst.SECOND)
+                push_buf.duration = int(interval * Gst.SECOND)
+                self.enc_src.emit('push-buffer', push_buf)
+                last_push = now
+            except Exception as exc:
+                self._notify_status(f'Error encoder H.264: {exc}')
+                time.sleep(0.1)
 
     def _launch_pipeline(self, node_id):
         caps = f'video/x-raw,width={self.width},height={self.height}' if not self.mirror else 'video/x-raw'
@@ -337,36 +447,44 @@ class DeskCastServer:
             p_str = (
                 f'pipewiresrc path={node_id} do-timestamp=true ! '
                 f'{caps} ! videoconvert n-threads=4 ! video/x-raw,format=I420 ! '
-                f'x264enc name=venc tune=zerolatency speed-preset=superfast bitrate={self.bitrate} '
-                f'vbv-buf-capacity=100 qp-min=10 qp-max=34 '
-                f'key-int-max=60 bframes=0 threads=4 sliced-threads=true rc-lookahead=0 ! '
-                f'h264parse config-interval=-1 ! '
-                f'video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! '
-                f'appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false'
+                f'appsink name=cap_sink emit-signals=true max-buffers=1 drop=true sync=false'
             )
+            try:
+                pipe = Gst.parse_launch(p_str)
+            except Exception as exc:
+                self._notify_status(f'Error GStreamer: {exc}')
+                return
+            cap_sink = pipe.get_by_name('cap_sink')
+            cap_sink.connect('new-sample', self._on_capture_sample)
+            gbus = pipe.get_bus()
+            gbus.add_signal_watch()
+            gbus.connect('message::error', self._on_gst_error)
+            pipe.set_state(Gst.State.PLAYING)
+            self.pipeline = pipe
+            self._pacer_running = True
+            self._cap_event.clear()
+            self._pacer_thread = threading.Thread(target=self._h264_pacer_loop, daemon=True)
+            self._pacer_thread.start()
         else:
             p_str = (
                 f'pipewiresrc path={node_id} do-timestamp=true ! '
                 f'{caps} ! videoconvert n-threads=4 ! video/x-raw,format=RGB ! '
                 f'appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false'
             )
+            try:
+                pipe = Gst.parse_launch(p_str)
+            except Exception as exc:
+                self._notify_status(f'Error GStreamer: {exc}')
+                return
+            self.x264enc = None
+            sink = pipe.get_by_name('sink')
+            sink.connect('new-sample', self._on_gst_sample)
+            gbus = pipe.get_bus()
+            gbus.add_signal_watch()
+            gbus.connect('message::error', self._on_gst_error)
+            pipe.set_state(Gst.State.PLAYING)
+            self.pipeline = pipe
 
-        try:
-            pipe = Gst.parse_launch(p_str)
-        except Exception as exc:
-            self._notify_status(f'Error GStreamer: {exc}')
-            return
-
-        self.x264enc = pipe.get_by_name('venc')
-        sink = pipe.get_by_name('sink')
-        sink.connect('new-sample', self._on_gst_sample)
-
-        gbus = pipe.get_bus()
-        gbus.add_signal_watch()
-        gbus.connect('message::error', self._on_gst_error)
-
-        pipe.set_state(Gst.State.PLAYING)
-        self.pipeline = pipe
         modo_txt = 'Espejo' if self.mirror else f'2º Monitor ({self.position})'
         enc_txt = 'H.264' if self.codec == 'h264' else 'Turbo Tiles'
         self._notify_status(f'Activo · {modo_txt} · {self.width}×{self.height} · {enc_txt}')
@@ -544,7 +662,7 @@ class DeskCastServer:
 
     def reconfigure(self, width=None, height=None, fps=None, quality=None,
                     position=None, mirror=None, pin=None, codec=None,
-                    bitrate=None, use_https=None):
+                    bitrate=None, use_https=None, keep_fps=None):
         need_restart = False
         if width is not None and int(width) != self.width:
             self.width = max(640, min(2560, int(width)))
@@ -560,6 +678,8 @@ class DeskCastServer:
             need_restart = True
         if use_https is not None:
             self.use_https = bool(use_https)
+        if keep_fps is not None:
+            self.keep_fps = bool(keep_fps)
         if bitrate is not None:
             self.bitrate = max(500, min(15000, int(bitrate)))
             if not need_restart and self.x264enc and self.glib_loop:

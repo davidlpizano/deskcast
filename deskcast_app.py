@@ -108,11 +108,19 @@ class DeskCastWindow(Adw.ApplicationWindow):
         grp_str = Adw.PreferencesGroup(title='Fluidez, Códec y Seguridad')
         left.append(grp_str)
 
-        self.row_fps = Adw.SpinRow.new_with_range(10, 60, 5)
-        self.row_fps.set_title('FPS máximos')
+        self.row_fps = Adw.SpinRow.new_with_range(10, 60, 1)
+        self.row_fps.set_title('FPS objetivo (24 / 30 / 60)')
         self.row_fps.set_value(30)
         self.row_fps.connect('notify::value', self._on_cfg_change)
         grp_str.add(self.row_fps)
+
+        self.row_keep_fps = Adw.SwitchRow(
+            title='Mantener FPS estables en reposo (H.264)',
+            subtitle='Emite micro-frames de ~60 bytes cuando no hay movimiento (~14 kbps)',
+        )
+        self.row_keep_fps.set_active(True)
+        self.row_keep_fps.connect('notify::active', self._on_cfg_change)
+        grp_str.add(self.row_keep_fps)
 
         self.row_qual = Adw.SpinRow.new_with_range(25, 95, 5)
         self.row_qual.set_title('Calidad Turbo Tiles (%)')
@@ -305,6 +313,7 @@ class DeskCastWindow(Adw.ApplicationWindow):
             codec=codec,
             bitrate=int(self.row_bitrate.get_value()),
             use_https=self.row_https.get_active(),
+            keep_fps=self.row_keep_fps.get_active(),
         )
 
     def _on_https_toggle(self, *_):
